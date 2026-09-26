@@ -1,0 +1,7 @@
+[package]
+name = "sixcam-stitch"
+version = "0.1.0"
+edition = "2021"
+description = "Stitch six inspection cameras from a symmetric circle grid"
+
+[dependencies]

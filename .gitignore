@@ -1,0 +1,7 @@
+/target/
+/output/
+/_preview/
+/_preview_ascii/
+**/*.pdb
+**/*.obj
+cmake-build-*/
