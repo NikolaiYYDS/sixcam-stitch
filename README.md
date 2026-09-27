@@ -23,7 +23,7 @@
 
 ## 标定文件
 
-`result/calibration.json`
+标定结果不放进本代码仓库。程序写到 `--out` 目录，默认是运行目录下的 `result/calibration.json`，该目录已加入 `.gitignore`。
 
 - `H_full_to_camera1`：该相机全分辨率像素到相机 1 像素的 3×3 单应，行主序。
 - `pairs`：相邻相机的单应、用的是圆点还是图纸、内点数和残差。残差单位是工作尺度像素，乘 `1/working_scale` 得到全分辨率像素。
@@ -44,10 +44,10 @@ cargo run --release -- --scale 0.3
 sixcam-stitch --data D:\path\260924标定数据 --out result --scale 0.3
 ```
 
-输出：
+输出写在 `--out`，不随代码提交：
 
-- `result/mosaic.jpg`：六相机全景，左为相机 1，右为相机 6
-- `result/overlap_N_on_M.jpg`：相邻相机叠化，用来看对齐
-- `result/calibration.json`：标定结果
+- `mosaic.jpg`：六相机全景，左为相机 1，右为相机 6
+- `overlap_N_on_M.jpg`：相邻相机叠化，用来看对齐
+- `calibration.json`：标定结果
 
 语言分工：Rust 负责目录、相机归组、单应链和标定文件；C++/OpenCV 负责读图、圆点、SIFT、变形和融合。
