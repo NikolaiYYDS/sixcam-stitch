@@ -1,6 +1,6 @@
 /target/
 /output/
-/result/
+/result/*.jpg
 /_preview/
 /_preview_ascii/
 **/*.pdb
