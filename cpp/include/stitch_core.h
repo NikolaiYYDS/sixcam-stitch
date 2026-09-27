@@ -67,6 +67,9 @@ SC_API int sc_fit_homography(
     double* H9,
     int* inliers);
 
+/* Same-camera frames, board masked out. Returns a new handle. */
+SC_API int sc_composite(const int* handles, int count, char* err, int err_len);
+
 SC_API int sc_save_overlap(
     int handle_src,
     int handle_dst,

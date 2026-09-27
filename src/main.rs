@@ -59,6 +59,7 @@ extern "C" {
         h9: *mut f64,
         inliers: *mut i32,
     ) -> i32;
+    fn sc_composite(handles: *const i32, count: i32, err: *mut c_char, err_len: i32) -> i32;
     fn sc_save_overlap(
         handle_src: i32,
         handle_dst: i32,
@@ -207,7 +208,12 @@ fn run() -> Result<(), String> {
         h_to_1.insert(src, mul(&prev, &pair.h_work));
     }
 
-    let handles: Vec<i32> = (1u32..=6).map(|cam| shots[primary[&cam]].handle).collect();
+    let mut handles = Vec::with_capacity(6);
+    for cam in 1u32..=6 {
+        let members: Vec<i32> = by_cam[&cam].iter().map(|i| shots[*i].handle).collect();
+        handles.push(composite_camera(&members)?);
+        println!("相机{cam} 已去掉标定板，用 {} 张图补图纸", members.len());
+    }
     let mut packed = Vec::with_capacity(6 * 9);
     for cam in 1u32..=6 {
         packed.extend_from_slice(&h_to_1[&cam]);
@@ -237,6 +243,9 @@ fn run() -> Result<(), String> {
     )?;
     println!("标定文件 {}", calib_path.display());
 
+    for handle in &handles {
+        unsafe { sc_close(*handle) };
+    }
     for shot in &shots {
         unsafe { sc_close(shot.handle) };
     }
@@ -451,7 +460,11 @@ fn calibrate_pair(
         println!("  圆点与背景单应中位差 {median:.2}px（工作尺度）");
         rms = Some(err);
         agree = Some(median);
-        if median < 40.0 * scale && err < 15.0 * scale && grid_scale_ok(&h_board, &circle_src) {
+        if median < 40.0 * scale
+            && err < 15.0 * scale
+            && grid_scale_ok(&h_board, &circle_src)
+            && orientation_ok(&h_board)
+        {
             h_use = h_board;
             method = "circle_grid";
         }
@@ -510,6 +523,11 @@ fn shared_grids_ok(shots: &[Shot], by_cam: &HashMap<u32, Vec<usize>>, src: u32, 
         }
     }
     true
+}
+
+fn orientation_ok(h: &Mat3) -> bool {
+    let det = h[0] * h[4] - h[1] * h[3];
+    det > 0.15
 }
 
 fn grid_scale_ok(h: &Mat3, src: &[[f64; 2]]) -> bool {
@@ -581,7 +599,10 @@ fn search_grid_homography(
                             }
                         }
                         let Ok((h, _)) = fit_homography(&src_pts, &dst_pts, 0.0) else { continue };
-                        if !grid_scale_ok(&h, &src_pts) {
+                        // Cameras look at the same side of the table, so the
+                        // plane map keeps orientation. A mirrored grid fit
+                        // stacks the next camera back on top of the previous one.
+                        if !orientation_ok(&h) || !grid_scale_ok(&h, &src_pts) {
                             continue;
                         }
                         let ncc = annulus_ncc(shots[*i].handle, shots[j].handle, &h, &dst_pts)?;
@@ -931,6 +952,15 @@ fn save_overlap(src: i32, dst: i32, h: &Mat3, path: &Path) -> Result<(), String>
         return Err(format!("保存重叠图失败: {}", cerr(&err)));
     }
     Ok(())
+}
+
+fn composite_camera(handles: &[i32]) -> Result<i32, String> {
+    let mut err = [0 as c_char; 512];
+    let handle = unsafe { sc_composite(handles.as_ptr(), handles.len() as i32, err.as_mut_ptr(), err.len() as i32) };
+    if handle < 0 {
+        return Err(format!("去掉标定板失败: {}", cerr(&err)));
+    }
+    Ok(handle)
 }
 
 fn stitch(handles: &[i32], h_to_ref: &[f64], path: &Path) -> Result<ScCanvas, String> {

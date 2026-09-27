@@ -4,6 +4,7 @@
 #include <opencv2/features2d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/photo.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -517,6 +518,208 @@ int sc_fit_homography(
     return 0;
 }
 
+}  // pause C linkage so the helper can return cv::Mat
+
+namespace {
+
+cv::Mat board_mask_of(const Image& image) {
+    cv::Mat mask(image.gray.size(), CV_8U, cv::Scalar(0));
+    if (image.grid.size() >= 4) {
+        std::vector<cv::Point> pts;
+        pts.reserve(image.grid.size());
+        std::vector<double> nearest;
+        nearest.reserve(image.grid.size());
+        for (size_t i = 0; i < image.grid.size(); ++i) {
+            pts.emplace_back(
+                static_cast<int>(std::lround(image.grid[i].x)),
+                static_cast<int>(std::lround(image.grid[i].y)));
+            double best = 1e9;
+            for (size_t j = 0; j < image.grid.size(); ++j) {
+                if (i == j) {
+                    continue;
+                }
+                const double dx = image.grid[i].x - image.grid[j].x;
+                const double dy = image.grid[i].y - image.grid[j].y;
+                best = std::min(best, std::sqrt(dx * dx + dy * dy));
+            }
+            nearest.push_back(best);
+        }
+        std::nth_element(nearest.begin(), nearest.begin() + nearest.size() / 2, nearest.end());
+        const double spacing = nearest[nearest.size() / 2];
+        std::vector<cv::Point> hull;
+        cv::convexHull(pts, hull);
+        cv::fillConvexPoly(mask, hull, 255);
+        const int rad = std::max(15, static_cast<int>(std::lround(spacing * 3.8)));
+        cv::dilate(mask, mask, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(rad, rad)));
+    }
+    return mask;
+}
+
+// Each camera's auto exposure and white balance leave a vertical color band.
+// Estimate the paper color on a coarse grid (median, so lines and clipped peaks do not dominate),
+// then pull that paper toward one white. Ink, panels, and the dark floor stay put.
+void flatten_paper(cv::Mat& bgr) {
+    const int cell = 48;
+    const int gw = (bgr.cols + cell - 1) / cell;
+    const int gh = (bgr.rows + cell - 1) / cell;
+    cv::Mat level(gh, gw, CV_32FC3, cv::Scalar(0, 0, 0));
+    cv::Mat known(gh, gw, CV_8U, cv::Scalar(0));
+    std::vector<int> bins[3];
+    for (int c = 0; c < 3; ++c) {
+        bins[c].reserve(static_cast<size_t>(cell * cell));
+    }
+    for (int gy = 0; gy < gh; ++gy) {
+        for (int gx = 0; gx < gw; ++gx) {
+            for (int c = 0; c < 3; ++c) {
+                bins[c].clear();
+            }
+            const int x1 = std::min(bgr.cols, (gx + 1) * cell);
+            const int y1 = std::min(bgr.rows, (gy + 1) * cell);
+            for (int y = gy * cell; y < y1; y += 2) {
+                const cv::Vec3b* row = bgr.ptr<cv::Vec3b>(y);
+                for (int x = gx * cell; x < x1; x += 2) {
+                    const int b = row[x][0];
+                    const int g = row[x][1];
+                    const int r = row[x][2];
+                    const int mn = std::min(b, std::min(g, r));
+                    const int mx = std::max(b, std::max(g, r));
+                    if (mn < 188 || mx - mn > 42) {
+                        continue;
+                    }
+                    bins[0].push_back(b);
+                    bins[1].push_back(g);
+                    bins[2].push_back(r);
+                }
+            }
+            if (bins[0].size() < 24) {
+                continue;
+            }
+            cv::Vec3f paper;
+            for (int c = 0; c < 3; ++c) {
+                const size_t mid = bins[c].size() / 2;
+                std::nth_element(bins[c].begin(), bins[c].begin() + static_cast<std::ptrdiff_t>(mid), bins[c].end());
+                paper[c] = static_cast<float>(bins[c][mid]);
+            }
+            level.at<cv::Vec3f>(gy, gx) = paper;
+            known.at<uchar>(gy, gx) = 255;
+        }
+    }
+    for (int pass = 0; pass < 8; ++pass) {
+        cv::Mat filled = level.clone();
+        cv::Mat next_known = known.clone();
+        for (int gy = 0; gy < gh; ++gy) {
+            for (int gx = 0; gx < gw; ++gx) {
+                if (known.at<uchar>(gy, gx) != 0) {
+                    continue;
+                }
+                cv::Vec3f sum(0, 0, 0);
+                int count = 0;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int ny = gy + dy;
+                        const int nx = gx + dx;
+                        if (ny < 0 || nx < 0 || ny >= gh || nx >= gw || known.at<uchar>(ny, nx) == 0) {
+                            continue;
+                        }
+                        sum += level.at<cv::Vec3f>(ny, nx);
+                        ++count;
+                    }
+                }
+                if (count > 0) {
+                    filled.at<cv::Vec3f>(gy, gx) = sum * (1.f / static_cast<float>(count));
+                    next_known.at<uchar>(gy, gx) = 255;
+                }
+            }
+        }
+        level = filled;
+        known = next_known;
+    }
+    cv::Mat smooth;
+    cv::resize(level, smooth, bgr.size(), 0, 0, cv::INTER_LINEAR);
+    cv::GaussianBlur(smooth, smooth, cv::Size(0, 0), 24);
+    const float target = 242.f;
+    for (int y = 0; y < bgr.rows; ++y) {
+        cv::Vec3b* row = bgr.ptr<cv::Vec3b>(y);
+        const cv::Vec3f* paper = smooth.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < bgr.cols; ++x) {
+            const int mn = std::min(row[x][0], std::min(row[x][1], row[x][2]));
+            const int mx = std::max(row[x][0], std::max(row[x][1], row[x][2]));
+            const float bright = std::clamp((static_cast<float>(mn) - 170.f) / 18.f, 0.f, 1.f);
+            const float neutral = std::clamp((48.f - static_cast<float>(mx - mn)) / 14.f, 0.f, 1.f);
+            const float amount = bright * neutral;
+            if (amount <= 0.f) {
+                continue;
+            }
+            for (int c = 0; c < 3; ++c) {
+                const float base = std::max(paper[x][c], 1.f);
+                const float gain = std::clamp(1.f + amount * (target / base - 1.f), 0.55f, 1.55f);
+                row[x][c] = static_cast<uchar>(std::clamp(row[x][c] * gain, 0.f, 255.f));
+            }
+        }
+    }
+}
+
+}  // namespace
+
+extern "C" {
+
+int sc_composite(const int* handles, int count, char* err, int err_len) {
+    if (handles == nullptr || count <= 0) {
+        set_err(err, err_len, "bad composite arguments");
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_mu);
+    Image* first = image_at(handles[0]);
+    if (first == nullptr) {
+        set_err(err, err_len, "invalid composite handle");
+        return -1;
+    }
+    cv::Mat out(first->bgr.size(), first->bgr.type(), cv::Scalar(0, 0, 0));
+    cv::Mat covered(first->gray.size(), CV_8U, cv::Scalar(0));
+    std::vector<int> order;
+    order.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        Image* image = image_at(handles[i]);
+        if (image != nullptr && image->grid.size() >= 4) {
+            order.push_back(i);
+        }
+    }
+    for (int i = 0; i < count; ++i) {
+        if (std::find(order.begin(), order.end(), i) == order.end()) {
+            order.push_back(i);
+        }
+    }
+    for (int i : order) {
+        Image* image = image_at(handles[i]);
+        if (image == nullptr || image->bgr.size() != first->bgr.size()) {
+            set_err(err, err_len, "composite size mismatch");
+            return -1;
+        }
+        cv::Mat board = board_mask_of(*image);
+        cv::Mat keep;
+        cv::bitwise_not(board, keep);
+        cv::bitwise_and(keep, covered == 0, keep);
+        image->bgr.copyTo(out, keep);
+        covered.setTo(255, keep);
+    }
+    cv::Mat holes;
+    cv::compare(covered, 0, holes, cv::CMP_EQ);
+    const int hole_px = cv::countNonZero(holes);
+    const int area = holes.rows * holes.cols;
+    if (hole_px > 0 && hole_px < area / 5) {
+        cv::Mat filled;
+        cv::inpaint(out, holes, filled, 4, cv::INPAINT_TELEA);
+        filled.copyTo(out, holes);
+    }
+    Image created;
+    created.bgr = out;
+    cv::cvtColor(out, created.gray, cv::COLOR_BGR2GRAY);
+    created.full_w = first->full_w;
+    created.full_h = first->full_h;
+    g_images.push_back(std::move(created));
+    return static_cast<int>(g_images.size() - 1);
+}
+
 int sc_save_overlap(
     int handle_src,
     int handle_dst,
@@ -534,8 +737,9 @@ int sc_save_overlap(
     cv::Mat H = h9_to_mat(H_src_to_dst);
     cv::Mat warped;
     cv::warpPerspective(src->bgr, warped, H, dst->bgr.size());
-    cv::Mat blend;
-    cv::addWeighted(warped, 0.5, dst->bgr, 0.5, 0, blend);
+    cv::Mat blend = dst->bgr.clone();
+    warped(cv::Rect(0, 0, warped.cols / 2, warped.rows)).copyTo(
+        blend(cv::Rect(0, 0, warped.cols / 2, warped.rows)));
     std::string message;
     if (!save_bgr(utf8_path, blend, message)) {
         set_err(err, err_len, message);
@@ -603,47 +807,164 @@ int sc_stitch(
                  0, fit, -static_cast<double>(min_y) * fit,
                  0, 0, 1);
 
-    cv::Mat acc(ch, cw, CV_32FC3, cv::Scalar(0, 0, 0));
-    cv::Mat weight(ch, cw, CV_32F, cv::Scalar(0));
+    // Each camera has its own exposure. Match color only where neighbors overlap,
+    // then blend the slow brightness and keep the sharp lines from one camera.
+    std::vector<cv::Mat> warped(static_cast<size_t>(n));
+    std::vector<cv::Mat> masks(static_cast<size_t>(n));
+    std::vector<cv::Mat> dists(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
         Image* image = image_at(handles[i]);
         cv::Mat H = T * homographies[static_cast<size_t>(i)];
-        cv::Mat warped;
-        cv::warpPerspective(image->bgr, warped, H, cv::Size(cw, ch));
+        cv::warpPerspective(image->bgr, warped[static_cast<size_t>(i)], H, cv::Size(cw, ch));
         cv::Mat mask;
         cv::warpPerspective(cv::Mat(image->bgr.size(), CV_8U, cv::Scalar(255)), mask, H, cv::Size(cw, ch));
         cv::threshold(mask, mask, 127, 255, cv::THRESH_BINARY);
-        cv::Mat dist;
-        cv::distanceTransform(mask, dist, cv::DIST_L2, 3);
-        double max_dist = 0;
-        cv::minMaxLoc(dist, nullptr, &max_dist);
-        if (max_dist > 0) {
-            dist /= max_dist;
-        }
-        cv::Mat warped_f;
-        warped.convertTo(warped_f, CV_32FC3);
-        std::vector<cv::Mat> channels(3);
-        cv::split(warped_f, channels);
+        cv::erode(mask, mask, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
+        masks[static_cast<size_t>(i)] = mask;
+    }
+    auto apply_gain = [](cv::Mat& image, const double gain[3]) {
+        std::vector<cv::Mat> channels;
+        cv::split(image, channels);
         for (int c = 0; c < 3; ++c) {
-            channels[static_cast<size_t>(c)] = channels[static_cast<size_t>(c)].mul(dist);
+            channels[static_cast<size_t>(c)].convertTo(channels[static_cast<size_t>(c)], CV_8U, gain[c], 0);
         }
-        cv::Mat weighted;
-        cv::merge(channels, weighted);
-        acc += weighted;
-        weight += dist;
+        cv::merge(channels, image);
+    };
+    for (int i = 1; i < n; ++i) {
+        cv::Mat overlap;
+        cv::bitwise_and(masks[static_cast<size_t>(i)], masks[static_cast<size_t>(i - 1)], overlap);
+        if (cv::countNonZero(overlap) < 800) {
+            continue;
+        }
+        std::vector<double> ratios[3];
+        for (int c = 0; c < 3; ++c) {
+            ratios[c].reserve(20000);
+        }
+        const cv::Mat& prev = warped[static_cast<size_t>(i - 1)];
+        const cv::Mat& cur = warped[static_cast<size_t>(i)];
+        for (int y = 0; y < ch; y += 4) {
+            const uchar* mrow = overlap.ptr<uchar>(y);
+            const cv::Vec3b* a = prev.ptr<cv::Vec3b>(y);
+            const cv::Vec3b* b = cur.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < cw; x += 4) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+                for (int c = 0; c < 3; ++c) {
+                    if (b[x][c] < 12) {
+                        continue;
+                    }
+                    ratios[c].push_back(static_cast<double>(a[x][c]) / static_cast<double>(b[x][c]));
+                }
+            }
+        }
+        double gain[3] = {1, 1, 1};
+        for (int c = 0; c < 3; ++c) {
+            if (ratios[c].size() < 50) {
+                continue;
+            }
+            const size_t mid = ratios[c].size() / 2;
+            std::nth_element(ratios[c].begin(), ratios[c].begin() + static_cast<std::ptrdiff_t>(mid), ratios[c].end());
+            gain[c] = std::clamp(ratios[c][mid], 0.55, 1.8);
+        }
+        apply_gain(warped[static_cast<size_t>(i)], gain);
     }
 
-    cv::Mat weight3;
-    cv::Mat weight_safe;
-    cv::max(weight, 1e-6, weight_safe);
-    cv::merge(std::vector<cv::Mat>{weight_safe, weight_safe, weight_safe}, weight3);
-    cv::Mat mosaic_f;
-    cv::divide(acc, weight3, mosaic_f);
-    cv::Mat mosaic;
-    mosaic_f.convertTo(mosaic, CV_8UC3);
+    std::vector<cv::Mat> low(static_cast<size_t>(n));
+    const int blur_k = std::max(31, (std::min(cw, ch) / 14) | 1);
+    for (int i = 0; i < n; ++i) {
+        cv::Mat image_f;
+        cv::Mat weight_f;
+        warped[static_cast<size_t>(i)].convertTo(image_f, CV_32FC3);
+        masks[static_cast<size_t>(i)].convertTo(weight_f, CV_32F, 1.0 / 255.0);
+        std::vector<cv::Mat> channels(3);
+        cv::split(image_f, channels);
+        for (int c = 0; c < 3; ++c) {
+            channels[static_cast<size_t>(c)] = channels[static_cast<size_t>(c)].mul(weight_f);
+        }
+        cv::merge(channels, image_f);
+        cv::GaussianBlur(image_f, image_f, cv::Size(blur_k, blur_k), 0, 0, cv::BORDER_REPLICATE);
+        cv::GaussianBlur(weight_f, weight_f, cv::Size(blur_k, blur_k), 0, 0, cv::BORDER_REPLICATE);
+        cv::max(weight_f, 1e-3, weight_f);
+        cv::split(image_f, channels);
+        for (int c = 0; c < 3; ++c) {
+            cv::divide(channels[static_cast<size_t>(c)], weight_f, channels[static_cast<size_t>(c)]);
+        }
+        cv::merge(channels, low[static_cast<size_t>(i)]);
+        cv::distanceTransform(masks[static_cast<size_t>(i)], dists[static_cast<size_t>(i)], cv::DIST_L2, 3);
+    }
+
+    cv::Mat mosaic(ch, cw, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat covered(ch, cw, CV_8U, cv::Scalar(0));
+    for (int y = 0; y < ch; ++y) {
+        cv::Vec3b* dst = mosaic.ptr<cv::Vec3b>(y);
+        uchar* crow = covered.ptr<uchar>(y);
+        for (int x = 0; x < cw; ++x) {
+            double wsum = 0;
+            double low_acc[3] = {0, 0, 0};
+            int winner = -1;
+            float best = 0;
+            for (int i = 0; i < n; ++i) {
+                if (masks[static_cast<size_t>(i)].ptr<uchar>(y)[x] == 0) {
+                    continue;
+                }
+                const float d = dists[static_cast<size_t>(i)].ptr<float>(y)[x];
+                const cv::Vec3f blur_pix = low[static_cast<size_t>(i)].ptr<cv::Vec3f>(y)[x];
+                wsum += d;
+                for (int c = 0; c < 3; ++c) {
+                    low_acc[c] += d * blur_pix[c];
+                }
+                if (d > best) {
+                    best = d;
+                    winner = i;
+                }
+            }
+            if (winner < 0 || wsum <= 0) {
+                continue;
+            }
+            const cv::Vec3b sharp = warped[static_cast<size_t>(winner)].ptr<cv::Vec3b>(y)[x];
+            const cv::Vec3f blur_w = low[static_cast<size_t>(winner)].ptr<cv::Vec3f>(y)[x];
+            cv::Vec3b pix;
+            for (int c = 0; c < 3; ++c) {
+                const double value = low_acc[c] / wsum + static_cast<double>(sharp[c]) - static_cast<double>(blur_w[c]);
+                pix[c] = static_cast<uchar>(std::clamp(value, 0.0, 255.0));
+            }
+            dst[x] = pix;
+            crow[x] = 255;
+        }
+    }
     if (rotate_ccw90) {
         cv::rotate(mosaic, mosaic, cv::ROTATE_90_COUNTERCLOCKWISE);
+        cv::rotate(covered, covered, cv::ROTATE_90_COUNTERCLOCKWISE);
     }
+    const int rw = mosaic.cols;
+    const int rh = mosaic.rows;
+    int min_r = 0;
+    int min_c = 0;
+    int max_r = rh - 1;
+    int max_c = rw - 1;
+    auto row_filled = [&](int y) {
+        return cv::countNonZero(covered.row(y)) > static_cast<int>(rw * 0.9);
+    };
+    auto col_filled = [&](int x) {
+        return cv::countNonZero(covered.col(x)) > static_cast<int>(rh * 0.9);
+    };
+    while (min_r < max_r && !row_filled(min_r)) {
+        ++min_r;
+    }
+    while (max_r > min_r && !row_filled(max_r)) {
+        --max_r;
+    }
+    while (min_c < max_c && !col_filled(min_c)) {
+        ++min_c;
+    }
+    while (max_c > min_c && !col_filled(max_c)) {
+        --max_c;
+    }
+    if (max_c > min_c && max_r > min_r) {
+        mosaic = mosaic(cv::Rect(min_c, min_r, max_c - min_c + 1, max_r - min_r + 1)).clone();
+    }
+    flatten_paper(mosaic);
     std::string message;
     if (!save_bgr(utf8_out_path, mosaic, message)) {
         set_err(err, err_len, message);
